@@ -4,6 +4,20 @@ Windows OBS Studio 脚本插件，从 OBS Virtual Camera 读取节目画面，�
 
 ## 首次设置
 
+### 单码开播
+
+已有工作区的用户，在主项目的发布 PowerShell 窗口生成推流码。窗口须已设置当前 Relay 的 `PERI_PUBLISH_TOKEN`。将下面的 IP 和端口换成你的 Relay 公网地址：
+
+```powershell
+python ..\obs-periapsis\peri_link.py 203.0.113.1:4444 localhost .\cert.der live/av1 | Set-Clipboard
+```
+
+在 OBS「工具 → 脚本」加载或重新加载 `peri_publish.py`，粘贴完整的 `peri://v1/…`，点击「开始 PERI 推流」。脚本会启动虚拟摄像机。点击「停止 PERI 推流」会释放本次启动的摄像机。首次加载所需的 OBS Python 和本机编码器见下文。
+
+推流码包含 Relay 地址、资源、TLS 服务器名称、信任证书和发布令牌。编码可逆，持有码的人可以发布。OBS 密码输入框只遮挡显示，保存或导出 OBS 配置时须按密钥保管。观众继续使用独立订阅凭据。
+
+### 手动配置
+
 1. 准备 PERI 工作区：需要 `target/debug/peri.exe`、`dist/live-python` 下的 PyAV，以及导出 `serve(frames)` 的 `scripts/live-av1-worker.py`。插件和主项目放在相邻目录最方便。在主项目的推流终端确认命令行发布可用，随后停止原来的发布者。
 2. 在 OBS「工具 → 脚本 → Python 设置」选择该版本 OBS 支持的 64 位 Python 安装目录。回到「脚本」页添加本仓库的 `peri_publish.py`。脚本所用 Python 与下面的编码器解释器可以不同。
 3. 在脚本属性设置 PERI 项目目录、Relay 的 IP:端口、证书服务器名、DER 证书、资源名和编码用 Python 的完整路径。发布令牌存放在仓库外、仅当前用户可读的文本文件中，选择该文件。OBS 配置只保存路径。
