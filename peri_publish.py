@@ -1,7 +1,8 @@
 """Start an OBS program broadcast through PERI. / 一键发布 OBS 节目画面与混音。"""
 import os
 import runpy
-import socket
+import ctypes
+import msvcrt
 import subprocess
 import tempfile
 import time
@@ -14,53 +15,44 @@ links = runpy.run_path(str(plugin_dir / "peri_link.py"))
 parse_link = links["parse"]
 config = {}
 publisher = None
-bridge = None
+native = None
 session_dir = None
 previous_service = None
 phase = "idle"
 deadline = 0.0
-local_port = 0
 log_path = None
 
 
-ENCODE_ARGS = (
-    "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=30",
-    "-c:v", "libaom-av1", "-usage", "realtime", "-cpu-used", "8",
-    "-lag-in-frames", "0", "-g", "30", "-b:v", "1500k", "-pix_fmt", "yuv420p",
-    "-c:a", "libopus", "-frame_duration", "20", "-ar", "48000", "-ac", "2", "-f", "nut",
-    "-flush_packets", "1",
-)
-working_ffmpeg = None
-
-
-def select_ffmpeg():
-    global working_ffmpeg
-    if working_ffmpeg:
-        return working_ffmpeg
-    override = os.environ.get("PERI_FFMPEG")
-    candidates = [Path(override)] if override else [
-        Path(entry.strip('"')) / "ffmpeg.exe" for entry in os.get_exec_path() if entry
-    ]
-    if not override:
-        candidates.append(Path.home() / "scoop/shims/ffmpeg.exe")
-    # Exercise the exact live filters, codecs and muxer before starting OBS.
-    # 开播前用相同滤镜、编码器与封装做短测，跳过同名但不兼容的程序。
-    for path in dict.fromkeys(candidates):
-        if not override and not path.is_file():
-            continue
-        try:
-            probe = subprocess.run([
-                str(path), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:r=30",
-                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.1",
-                *ENCODE_ARGS, "pipe:1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW, timeout=4)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if probe.returncode == 0:
-            working_ffmpeg = str(path)
-            obs.script_log(obs.LOG_INFO, f"PERI 编码器已验证：{path}")
-            return working_ffmpeg
-    raise ValueError("未找到通过 AV1/Opus 编码测试的 FFmpeg，请检查 PERI_FFMPEG 或安装完整版 FFmpeg")
+def load_native():
+    global native
+    if native is not None:
+        return native
+    path = plugin_dir / "native/peri-output.dll"
+    if not path.is_file():
+        raise ValueError(f"缺少 PERI 原生输出模块：{path}")
+    # Use libobs's module loader so it owns registration and lifetime across script reloads.
+    # 通过 libobs 加载模块，脚本重载时沿用已注册的类型和模块生命周期。
+    api = ctypes.CDLL("obs.dll")
+    ptr = ctypes.c_void_p
+    api.obs_get_module.argtypes = [ctypes.c_char_p]
+    api.obs_get_module.restype = ptr
+    module = api.obs_get_module(b"peri-output")
+    if not module:
+        module = ptr()
+        api.obs_open_module.argtypes = [ctypes.POINTER(ptr), ctypes.c_char_p, ctypes.c_char_p]
+        api.obs_open_module.restype = ctypes.c_int
+        api.obs_init_module.argtypes = [ptr]
+        api.obs_init_module.restype = ctypes.c_bool
+        if api.obs_open_module(ctypes.byref(module), str(path).encode(), str(path.parent).encode()) != 0 or not api.obs_init_module(module):
+            raise ValueError("无法加载 PERI 原生模块，请查看 OBS 日志并确认使用 OBS 32.1.x x64")
+    api.obs_get_module_binary_path.argtypes = [ptr]
+    api.obs_get_module_binary_path.restype = ctypes.c_char_p
+    loaded = api.obs_get_module_binary_path(module)
+    dll = ctypes.CDLL(os.fsdecode(loaded))
+    dll.peri_bind_sink.argtypes = [ptr]
+    dll.peri_bind_sink.restype = ctypes.c_bool
+    native = dll
+    return dll
 
 
 def script_description():
@@ -68,9 +60,8 @@ def script_description():
 
 
 def script_defaults(settings):
-    for key, value in (("stream_key", "stream"), ("address", "127.0.0.1:4444"), ("name", "localhost"),
-                       ("resource", "live/av1"), ("core", str(plugin_dir.parent / "periapsis")), ("cert", str(plugin_dir.parent / "periapsis/cert.der")),
-                       ("python", os.environ.get("PERI_PYTHON", "python"))):
+    for key, value in (("stream_key", "stream"), ("name", "localhost"),
+                       ("resource", "live/av1"), ("core", str(plugin_dir.parent / "periapsis")), ("cert", str(plugin_dir.parent / "periapsis/cert.der"))):
         obs.obs_data_set_default_string(settings, key, value)
 
 
@@ -85,7 +76,7 @@ def script_properties():
     advanced = obs.obs_properties_create()
     obs.obs_properties_add_text(advanced, "link", "旧版邀请链接", obs.OBS_TEXT_PASSWORD)
     for key, label in (("name", "证书服务器名"),
-                       ("resource", "资源名"), ("python", "编码用 Python 路径")):
+                       ("resource", "资源名"),):
         obs.obs_properties_add_text(advanced, key, label, obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_path(advanced, "core", "PERI 项目目录", obs.OBS_PATH_DIRECTORY, None, None)
     obs.obs_properties_add_path(advanced, "cert", "服务器证书 (.der)", obs.OBS_PATH_FILE, "*.der", None)
@@ -103,12 +94,12 @@ def show_advanced(props, prop, settings):
 def script_update(settings):
     config["show_advanced"] = obs.obs_data_get_bool(settings, "show_advanced")
     # Editing settings only prepares the next broadcast. / 编辑设置仅影响下次开播。
-    for key in ("server", "stream_key", "link", "core", "address", "name", "resource", "python", "cert", "token"):
+    for key in ("server", "stream_key", "link", "core", "name", "resource", "cert"):
         config[key] = obs.obs_data_get_string(settings, key)
 
 
 def begin(props, prop):
-    global publisher, bridge, session_dir, phase, deadline, local_port, log_path
+    global publisher, session_dir, phase, deadline, log_path
     if phase != "idle":
         return False
     if obs.obs_frontend_streaming_active():
@@ -116,7 +107,7 @@ def begin(props, prop):
         return False
     try:
         root = Path(config["core"]).resolve()
-        address, name, resource, cert = (config[k] for k in ("address", "name", "resource", "cert"))
+        name, resource, cert = (config[k] for k in ("name", "resource", "cert"))
         if config["server"].strip():
             address, token = links["short_settings"](config["server"], config["stream_key"])
             if not Path(cert).is_file():
@@ -130,35 +121,26 @@ def begin(props, prop):
             raise ValueError("请先填写服务器地址 peri://IP 和推流码")
         if not (32 <= len(token) <= 128 and all("!" <= c <= "~" for c in token)):
             raise ValueError("发布令牌文件格式无效")
-        env = dict(os.environ, PERI_PUBLISH_TOKEN=token, PERI_ENCODER_SCRIPT=str(root / "scripts/live-av1-worker.py"),
-                   PERI_PYTHON=config["python"], PYTHONPATH=str(root / "dist/live-python"))
-        args = [config["python"], str(root / "scripts/program-av.py"), "publish",
-                address, name, cert, resource, "--peri", str(root / "target/debug/peri.exe"), "--stdin-program"]
+        env = dict(os.environ, PERI_PUBLISH_TOKEN=token)
+        dll = load_native()
+        binaries = [root / "target" / profile / "peri.exe" for profile in ("release", "debug")]
+        binary = max((p for p in binaries if p.is_file()), key=lambda p: p.stat().st_mtime, default=None)
+        if binary is None:
+            raise ValueError("找不到 peri.exe，请先构建 peri-native")
+        args = [str(binary), "av-publish", address, name, cert, resource]
         log_path = root / "dist/obs-publish.log"
         log_path.parent.mkdir(exist_ok=True)
-        # Use a fresh loopback port per broadcast. / 每次开播选用新的本机回环端口。
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            local_port = probe.getsockname()[1]
         with log_path.open("wb") as output:
-            ffmpeg = select_ffmpeg()
-            bridge = subprocess.Popen([
-                ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
-                "-listen", "1", "-i", f"rtmp://127.0.0.1:{local_port}/live/peri",
-                "-map", "0:v:0", "-map", "0:a:0",
-                *ENCODE_ARGS, "pipe:1"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=output,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            source = bridge.stdout
-            try:
-                publisher = subprocess.Popen(args, cwd=root, env=env, stdout=output,
-                                             stderr=subprocess.STDOUT, stdin=source,
-                                             creationflags=subprocess.CREATE_NO_WINDOW)
-            finally:
-                if bridge and bridge.stdout:
-                    bridge.stdout.close()
-        phase, deadline = "arming", time.monotonic() + 10
-    except (OSError, ValueError, KeyError) as error:
+            publisher = subprocess.Popen(args, cwd=root, env=env, stdout=output,
+                                         stderr=subprocess.STDOUT, stdin=subprocess.PIPE,
+                                         creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            if not dll.peri_bind_sink(msvcrt.get_osfhandle(publisher.stdin.fileno())):
+                raise OSError("无法绑定 PERI 编码包管道")
+        finally:
+            publisher.stdin.close()
+        start_stream()
+    except (OSError, ValueError, KeyError, RuntimeError, AttributeError) as error:
         stop()
         obs.script_log(obs.LOG_ERROR, str(error))
     return False
@@ -168,9 +150,7 @@ def start_stream():
     global previous_service, phase, deadline
     settings = obs.obs_data_create()
     try:
-        obs.obs_data_set_string(settings, "server", f"rtmp://127.0.0.1:{local_port}/live")
-        obs.obs_data_set_string(settings, "key", "peri")
-        service = obs.obs_service_create("rtmp_custom", "PERI local program", settings, None)
+        service = obs.obs_service_create("peri_native_service", "PERI", settings, None)
     finally:
         obs.obs_data_release(settings)
     if not service:
@@ -206,31 +186,17 @@ def poll():
                 deadline = time.monotonic() + 3
             else:
                 phase = "finishing"
-        if phase == "finishing" and all(not p or p.poll() is not None for p in (bridge, publisher)):
+        if phase == "finishing" and (publisher is None or publisher.poll() is not None):
             stop()
         return
-    if publisher.poll() is not None or bridge.poll() is not None:
+    if publisher.poll() is not None:
         obs.script_log(obs.LOG_ERROR, f"发布进程已退出，请查看 {log_path}")
         end(None, None)
         return
-    if phase in ("arming", "starting") and time.monotonic() >= deadline:
+    if phase == "starting" and time.monotonic() >= deadline:
         obs.script_log(obs.LOG_ERROR, "等待 OBS 开播超时，请查看直播日志")
         end(None, None)
         return
-    if phase == "arming":
-        # A TCP connect probe would consume the listener's single input.
-        # 通过探测端口占用等待监听就绪，避免连接探测抢占唯一输入。
-        with socket.socket() as probe:
-            try:
-                probe.bind(("127.0.0.1", local_port))
-            except OSError:
-                try:
-                    if obs.obs_frontend_streaming_active():
-                        raise RuntimeError("OBS 已启动其他直播")
-                    start_stream()
-                except (AttributeError, RuntimeError, TypeError) as error:
-                    obs.script_log(obs.LOG_ERROR, str(error))
-                    end(None, None)
 
 
 def begin_shutdown():
@@ -238,34 +204,31 @@ def begin_shutdown():
     if phase in ("idle", "stopping", "finishing"):
         return
     phase, deadline = "stopping", time.monotonic() + 3
-    # Release the local RTMP receiver so the OBS output can finish.
-    # 释放本机 RTMP 接收端，使 OBS 输出可以结束。
-    for child in (publisher, bridge):
-        if child and child.poll() is None:
-            child.terminate()
+    # Close the pipe reader before waiting for OBS. / 先关闭管道读端，再等待 OBS 停播。
+    if publisher and publisher.poll() is None:
+        publisher.terminate()
 
 
 def end(props, prop):
     if phase in ("starting", "live"):
         begin_shutdown()
         obs.obs_frontend_streaming_stop()
-    elif phase == "arming":
-        begin_shutdown()
     return False
 
 
 def stop():
-    global publisher, bridge, session_dir, previous_service, phase
+    global publisher, session_dir, previous_service, phase
     phase = "idle"
-    for child in (bridge, publisher):
-        if child and child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
-    publisher = bridge = None
+    if publisher and publisher.poll() is None:
+        publisher.terminate()
+        try:
+            publisher.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            publisher.kill()
+            publisher.wait()
+    publisher = None
+    if native:
+        native.peri_bind_sink(None)
     if session_dir:
         session_dir.cleanup()
         session_dir = None
