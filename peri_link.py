@@ -1,5 +1,7 @@
 """Create and read a versioned PERI publisher invitation."""
 import argparse
+import hashlib
+from urllib.parse import urlsplit
 import base64
 import binascii
 import ipaddress
@@ -9,6 +11,25 @@ import sys
 from pathlib import Path
 
 PREFIX = "peri://v1/"
+
+
+def short_settings(server, key):
+    # Keep TLS trust separate from the short server URL.
+    # 短服务器地址与 TLS 信任证书分开配置。
+    url = urlsplit(server.strip())
+    if (url.scheme != "peri" or not url.hostname or url.path not in ("", "/")
+            or url.username is not None or url.query or url.fragment):
+        raise ValueError("服务器地址格式为 peri://IP 或 peri://IP:端口")
+    host = ipaddress.ip_address(url.hostname)
+    if host.is_unspecified:
+        raise ValueError("请把监听地址换成 OBS 可访问的服务器 IP；同机可填 127.0.0.1")
+    port = 4444 if url.port is None else url.port
+    if port == 0:
+        raise ValueError("服务器端口范围为 1..65535")
+    if not 1 <= len(key.encode("utf8")) <= 128 or not key.isprintable():
+        raise ValueError("推流码应为 1 到 128 字节的可打印文本")
+    address = f"[{host}]:{port}" if host.version == 6 else f"{host}:{port}"
+    return address, hashlib.sha256(b"peri-stream-key-v1\0" + key.encode("utf8")).hexdigest()
 
 
 def parse(link):

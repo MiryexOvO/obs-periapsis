@@ -4,7 +4,11 @@ Windows OBS Studio 脚本插件，从 OBS Virtual Camera 读取节目画面，�
 
 ## 首次设置
 
-### 单码开播
+### 服务器和推流码
+
+加载 peri_publish.py，在脚本属性中填写服务器 peri://IP（其他 UDP 端口写 peri://IP:端口），推流码默认 stream。首次在高级设置选择该 Relay 的 cert.der，并核对资源名和证书服务器名。服务器运行 peri-server.py link 可查看两栏；stream-key 可设置新码，重启 Relay 后生效。
+
+### 旧版长邀请
 
 已有工作区的用户，在主项目的发布 PowerShell 窗口生成推流码。窗口须已设置当前 Relay 的 `PERI_PUBLISH_TOKEN`。将下面的 IP 和端口换成你的 Relay 公网地址：
 
@@ -12,7 +16,7 @@ Windows OBS Studio 脚本插件，从 OBS Virtual Camera 读取节目画面，�
 python ..\obs-periapsis\peri_link.py 203.0.113.1:4444 localhost .\cert.der live/av1 | Set-Clipboard
 ```
 
-在 OBS「工具 → 脚本」加载或重新加载 `peri_publish.py`，粘贴完整的 `peri://v1/…`，点击「开始 PERI 推流」。脚本会启动虚拟摄像机。点击「停止 PERI 推流」会释放本次启动的摄像机。首次加载所需的 OBS Python 和本机编码器见下文。
+在 OBS「工具 → 脚本」加载或重新加载 `peri_publish.py`，留空服务器栏，在高级设置的旧版邀请栏粘贴完整的 `peri://v1/…`，点击「开始 PERI 推流」。脚本会启动虚拟摄像机。点击「停止 PERI 推流」会释放本次启动的摄像机。首次加载所需的 OBS Python 和本机编码器见下文。
 
 推流码包含 Relay 地址、资源、TLS 服务器名称、信任证书和发布令牌。编码可逆，持有码的人可以发布。OBS 密码输入框只遮挡显示，保存或导出 OBS 配置时须按密钥保管。观众继续使用独立订阅凭据。
 
@@ -25,4 +29,4 @@ python ..\obs-periapsis\peri_link.py 203.0.113.1:4444 localhost .\cert.der live/
 
 ## 第一次联调
 
-Relay 输出 `PERI_RESOURCE_READY` 后，确认主项目 `dist/obs-publish.log` 中连续出现 `PERI_ENCODED`，再让观众加入。日志每轮覆盖。如果 DirectShow 打不开 `OBS Virtual Camera`，先确认 OBS 已启动虚拟摄像机，且该设备已注册。脚本不会自动安装驱动。此版本只传输视频。
+Relay 输出 `PERI_RESOURCE_READY` 后，确认主项目 `dist/obs-publish.log` 中连续出现 `PERI_ENCODED`，再让观众加入。日志每轮覆盖。如果 DirectShow 打不开 `OBS Virtual Camera`，先确认 OBS 已启动虚拟摄像机，且该设备已注册。脚本不会自动安装驱动。虚拟摄像机模式只传输视频。节目混音模式选用本机 WebM 输出，配置见相邻 PERI 项目的 docs/PERI-PROGRAM-AV.md。

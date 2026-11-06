@@ -8,7 +8,8 @@ from pathlib import Path
 import obspython as obs
 
 plugin_dir = Path(__file__).resolve().parent
-parse_link = runpy.run_path(str(plugin_dir / "peri_link.py"))["parse"]
+links = runpy.run_path(str(plugin_dir / "peri_link.py"))
+parse_link = links["parse"]
 config = {}
 publisher = None
 session_dir = None
@@ -17,11 +18,11 @@ owns_camera = False
 
 
 def script_description():
-    return "粘贴发布端专用的 peri:// 推流码，然后点击开始推流。"
+    return "填写服务器和推流码，首次在高级设置选择 Relay 的 cert.der。"
 
 
 def script_defaults(settings):
-    for key, value in (("address", "127.0.0.1:4444"), ("name", "localhost"),
+    for key, value in (("stream_key", "stream"), ("address", "127.0.0.1:4444"), ("name", "localhost"),
                        ("resource", "live/av1"), ("core", str(plugin_dir.parent / "periapsis")), ("cert", str(plugin_dir.parent / "periapsis/cert.der")),
                        ("python", os.environ.get("PERI_PYTHON", "python"))):
         obs.obs_data_set_default_string(settings, key, value)
@@ -29,10 +30,13 @@ def script_defaults(settings):
 
 def script_properties():
     props = obs.obs_properties_create()
-    obs.obs_properties_add_text(props, "link", "PERI 推流码", obs.OBS_TEXT_PASSWORD)
+    obs.obs_properties_add_text(props, "server", "服务器（peri://IP）", obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_text(props, "stream_key", "推流码", obs.OBS_TEXT_PASSWORD)
+    obs.obs_properties_add_bool(props, "program_av", "节目画面 + 混音（本机 WebM 输出）")
     obs.obs_properties_add_button(props, "start", "开始 PERI 推流", begin)
     obs.obs_properties_add_button(props, "stop", "停止 PERI 推流", end)
     advanced = obs.obs_properties_create()
+    obs.obs_properties_add_text(advanced, "link", "旧版邀请链接", obs.OBS_TEXT_PASSWORD)
     for key, label in (("address", "Relay IP:端口"), ("name", "证书服务器名"),
                        ("resource", "资源名"), ("python", "编码用 Python 路径")):
         obs.obs_properties_add_text(advanced, key, label, obs.OBS_TEXT_DEFAULT)
@@ -46,7 +50,11 @@ def script_properties():
 
 def script_update(settings):
     was_enabled = config.get("enabled")
-    for key in ("link", "core", "address", "name", "resource", "python", "cert", "token"):
+    program_av = obs.obs_data_get_bool(settings, "program_av")
+    if config.get("program_av", False) != program_av:
+        stop()
+    config["program_av"] = program_av
+    for key in ("server", "stream_key", "link", "core", "address", "name", "resource", "python", "cert", "token"):
         config[key] = obs.obs_data_get_string(settings, key)
     config["enabled"] = obs.obs_data_get_bool(settings, "enabled")
     if was_enabled and not config["enabled"]:
@@ -58,11 +66,14 @@ def begin(props, prop):
     if publisher is not None:
         return False
     try:
-        parse_link(config["link"].strip())
+        if config["server"].strip():
+            links["short_settings"](config["server"], config["stream_key"])
+        else:
+            parse_link(config["link"].strip())
     except ValueError as error:
         obs.script_log(obs.LOG_ERROR, str(error))
         return False
-    if obs.obs_frontend_virtualcam_active():
+    if config.get("program_av") or obs.obs_frontend_virtualcam_active():
         start()
     else:
         pending = owns_camera = True
@@ -82,7 +93,11 @@ def start():
     try:
         root = Path(config["core"]).resolve()
         address, name, resource, cert = (config[k] for k in ("address", "name", "resource", "cert"))
-        if config["link"].strip():
+        if config["server"].strip():
+            address, token = links["short_settings"](config["server"], config["stream_key"])
+            if not Path(cert).is_file():
+                raise ValueError("请在高级设置选择服务器的 cert.der")
+        elif config["link"].strip():
             address, name, resource, token, der = parse_link(config["link"].strip())
             session_dir = tempfile.TemporaryDirectory(prefix="peri-obs-")
             cert = str(Path(session_dir.name) / "cert.der")
@@ -95,6 +110,11 @@ def start():
                    PERI_PYTHON=config["python"], PYTHONPATH=str(root / "dist/live-python"))
         args = [str(root / "target/debug/peri.exe"), "live", address, name,
                 cert, resource, str(plugin_dir / "obs_camera.py"), "13500"]
+        if config.get("program_av"):
+            # OBS supplies the encoded program mix over loopback.
+            # OBS 通过回环连接提供已编码的节目画面和混音。
+            args = [config["python"], str(root / "scripts/program-av.py"), "publish",
+                    address, name, cert, resource, "--peri", str(root / "target/debug/peri.exe")]
         # 令牌只通过环境传给发布进程。 / Pass the token to the child via its environment.
         log = root / "dist/obs-publish.log"
         with log.open("wb") as output:
@@ -135,6 +155,8 @@ def stop():
 
 def event(kind):
     global pending
+    if config.get("program_av"):
+        return
     if kind == obs.OBS_FRONTEND_EVENT_VIRTUALCAM_STARTED:
         if pending or config.get("enabled"):
             pending = False
