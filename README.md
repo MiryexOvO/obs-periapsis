@@ -1,23 +1,23 @@
-# OBS PERI 推流
+# PERI for OBS Studio
 
-在 OBS「工具 → 脚本」加载同目录下的 peri_publish.py，填写服务器（peri://IP 或 peri://IP:公网UDP端口）和推流码。点击「开始 PERI 推流」，脚本启动 OBS 直播，将节目画面及混音送往 PERI Relay。点击脚本的停止按钮或 OBS 主窗口的「停止直播」结束；编辑字段只影响下一次手动开播。
+## 主播安装 / Windows x64
 
-## 首次连接
+已在 OBS Studio 32.1.2 x64 验证。下载并解压 `PERI-OBS-Windows-x64.zip`。从「工具 → 脚本」移除旧的 `peri_publish.py`（如果已加载），完全退出 OBS，再双击 `Install-PERI.cmd`。出现写入权限错误时以管理员身份运行。安装器把插件复制到 Windows 的 ProgramData OBS 插件目录。便携版也可手动将包内的 peri-output.dll 和 peri_obs.dll 放到 OBS 安装目录的 obs-plugins/64bit。
 
-使用自签名证书时，在「显示高级设置」中选取从该 Relay 复制的 cert.der。如果服务端使用自定义资源名或证书服务器名，在同一处修改。默认资源 live/av1，证书名 localhost。高级设置也支持旧版邀请链接（服务器栏留空）。
+1. 管理员在服务器运行 `./target/release/peri-webtransport obs-token --public-ip 主播可达的IPv4`，私下把整段发布 Token 给主播。Token 包含目标 UDP 地址、资源名、TLS 名称、公开证书和发布凭据。轮换推流码或证书后重新签发。
+2. 打开「设置 → 直播」，服务选择 **PERI**，将整段 Token 粘贴进「推流码」。服务器选项使用 Token 内的地址。
+3. 在「设置 → 输出 → 直播」选择 AV1，在「设置 → 视频」选择分辨率和帧率，点击主窗口「开始直播」。停止使用同一窗口的「停止直播」。
 
-## 主播端运行环境
+主播端运行依赖为 OBS 及其编码器。C++ 插件通过 C ABI 调用安装包内的 Rust 动态库 peri_obs.dll。原生回调将编码包放入有界环形缓冲区。网络线程停读时回调直接丢包；丢过视频包后等待关键帧再发布视频，避免传播断裂的参考帧链。普通停播取消网络等待后回收线程。插件沿用 AV1 与 Opus 配置，NVENC 的 B 帧会在本次发布专用实例中禁用，其他不兼容格式回退到 AV1 / Opus。
 
-已验证 Windows x64 的 OBS 32.1.2。保留本仓库的目录结构（包括 native/peri-output.dll），启用 OBS 的 Python 脚本支持。默认从相邻的 periapsis 目录查找 target/release/peri.exe 或 target/debug/peri.exe，使用其中最近构建的版本。更新 DLL 前先退出 OBS。
+OBS 32 的直播设置从 rtmp-services 的服务清单读取可选项。插件启动时在当前用户清单中登记 PERI，媒体经 PERI 输出模块发送。内置服务清单更新后，插件会重新合并 PERI 项。卸载时退出 OBS，移除已安装的 peri-output 插件目录即可。
 
-原生输出模块直接接收 OBS 的 AV1 视频和 Opus 混音编码包，经本机匿名管道交给 peri.exe，再通过 QUIC 发往 Relay。OBS 自带的编码器完成编码，主播端无需另装 FFmpeg 或 PyAV。视频目标码率 20 Mbps，音频 128 kbps。要推 1440p60，请在 OBS「设置 → 视频」选择 2560×1440 的输出分辨率和 60 fps。已验证 NVIDIA NVENC AV1；软件编码的实时性能取决于 CPU。
+## 开发构建 / Build
 
-在脚本面板点击「开始 PERI 推流」。停播可使用 OBS 主窗口的「停止直播」。服务器输出 PERI_RESOURCE_READY 表示收到资源；连接失败时查看主项目的 dist/obs-publish.log 和 OBS 日志。
-
-## 重新构建原生模块 / Rebuild the native module
-
-在 x64 Visual Studio Developer PowerShell 中，为 OBS 32.1.2 的 libobs 头文件目录及 64 位 obs.lib 提供绝对路径，退出 OBS 后从本仓库运行：
+将此仓库与 periapsis 仓库并排放置。在安装了 Rust 和 x64 MSVC 的开发者 PowerShell 中运行：
 
 ```powershell
 ./native/build.ps1 -ObsInclude D:/sdk/libobs -ObsLibrary D:/sdk/lib/obs.lib
 ```
+
+生成的 ZIP 位于本仓库根目录。tests/ring-pressure.cpp 可链接 obs.lib 做独立的拥塞回归测试；它让网络消费者完全停读，并验证回调返回、容量和关键帧恢复。
