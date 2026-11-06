@@ -4,13 +4,12 @@
 #include <windows.h>
 #include <obs-module.h>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
+#include <array>
+#include <filesystem>
 #include <cstdint>
 #include <cstring>
-#include <deque>
-#include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -20,17 +19,11 @@ MODULE_EXPORT const char *obs_module_description(void) { return "PERI AV1/Opus o
 namespace {
 using Bytes = std::vector<uint8_t>;
 constexpr size_t max_payload = 1024 * 1024 - 68;
-std::mutex binding_lock;
-HANDLE pending = nullptr;
-
-// A one-use handle is never stored in an OBS profile. / 管道句柄只使用一次，不写入 OBS 配置。
-HANDLE take_binding()
-{
-    std::lock_guard guard(binding_lock);
-    HANDLE pipe = pending;
-    pending = nullptr;
-    return pipe;
-}
+extern "C" void *peri_live_open(const char *, void **, char *, size_t);
+extern "C" bool peri_live_send(void *, const uint8_t *, size_t, char *, size_t);
+extern "C" void peri_live_cancel(void *);
+extern "C" void peri_live_close(void *);
+extern "C" bool peri_register_catalog(const char *, const char *);
 
 void append_be(Bytes &buf, uint64_t n, unsigned width)
 {
@@ -56,67 +49,65 @@ std::string extra(obs_encoder_t *encoder)
 struct Output {
     explicit Output(obs_output_t *o) : obs(o) {}
     obs_output_t *obs;
-    HANDLE pipe = nullptr;
+    // OBS interleaves encoded packets on one producer; only the writer advances tail.
+    // OBS 串行交付交织编码包，只有网络线程推进读指针。
+    static constexpr uint32_t capacity = 32;
+    std::array<Bytes, capacity> ring;
+    std::atomic<uint32_t> head{0}, tail{0};
+    HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     std::thread worker;
-    std::mutex lock;
-    std::condition_variable wake;
-    std::deque<Bytes> queue;
-    size_t queued = 0;
+    void *live = nullptr, *cancel = nullptr;
     std::atomic<bool> closing{true}, failed{false};
-    std::atomic<uint64_t> bytes{0};
-    bool joined = false;
+    std::atomic<uint64_t> bytes{0}, dropped{0};
+    char error[512]{};
+    bool joined = false, need_key = true;
     int64_t origin = 0;
     uint32_t audio_duration = 0, video_duration = 0;
+    ~Output() { if (ready) CloseHandle(ready); }
 
-    bool enqueue(Bytes block)
+    Bytes *reserve_slot()
     {
-        std::lock_guard guard(lock);
-        if (closing || failed || queue.size() >= 32 || queued + block.size() > 4 * 1024 * 1024)
-            return false;
-        queued += block.size();
-        queue.push_back(std::move(block));
-        wake.notify_one();
-        return true;
+        auto write = head.load(std::memory_order_relaxed);
+        if (write - tail.load(std::memory_order_acquire) >= capacity) return nullptr;
+        auto &slot = ring[write % capacity];
+        slot.clear();
+        return &slot;
+    }
+    void commit()
+    {
+        head.fetch_add(1, std::memory_order_release);
+        SetEvent(ready);
     }
     void write_packets()
     {
-        while (true) {
-            Bytes next;
-            {
-                std::unique_lock guard(lock);
-                wake.wait(guard, [&] { return closing || !queue.empty(); });
-                if (closing) return;
-                next = std::move(queue.front());
-                queue.pop_front();
-                queued -= next.size();
+        while (!closing.load()) {
+            auto read = tail.load(std::memory_order_relaxed);
+            if (read == head.load(std::memory_order_acquire)) {
+                WaitForSingleObject(ready, INFINITE);
+                continue;
             }
-            DWORD count = 0;
-            if (!WriteFile(pipe, next.data(), static_cast<DWORD>(next.size()), &count, nullptr) ||
-                count != next.size()) {
-                failed = true;
+            auto &block = ring[read % capacity];
+            if (!peri_live_send(live, block.data(), block.size(), error, sizeof error)) {
+                failed.store(true);
                 return;
             }
-            bytes += count;
+            bytes += block.size();
+            tail.store(read + 1, std::memory_order_release);
         }
     }
     void shutdown()
     {
-        {
-            std::lock_guard guard(lock);
-            closing = true;
-            queue.clear();
-            queued = 0;
-        }
-        wake.notify_all();
-        if (worker.joinable()) {
-            // Cancel even if the writer entered WriteFile after our stop signal.
-            // 即使写线程稍晚进入 WriteFile，也能取消并结束。
-            HANDLE thread = worker.native_handle();
-            while (WaitForSingleObject(thread, 10) == WAIT_TIMEOUT) CancelSynchronousIo(thread);
-            worker.join();
-        }
-        if (pipe) CloseHandle(pipe);
-        pipe = nullptr;
+        closing = true;
+        if (ready) SetEvent(ready);
+        peri_live_cancel(cancel);
+        cancel = nullptr;
+        if (worker.joinable()) worker.join();
+        peri_live_close(live);
+        live = nullptr;
+        if (auto count = dropped.exchange(0))
+            blog(LOG_INFO, "[PERI] Backpressure drops / 拥塞丢弃包数: %llu", (unsigned long long)count);
+        head = 0;
+        tail = 0;
     }
     Bytes catalog()
     {
@@ -141,7 +132,7 @@ struct Output {
     }
 };
 
-bool configure_encoders(Output *o)
+obs_encoder_t *fallback_video_encoder()
 {
     auto *settings = obs_data_create();
     obs_data_set_string(settings, "rate_control", "CBR");
@@ -156,32 +147,81 @@ bool configure_encoders(Output *o)
         if (v) break;
     }
     obs_data_release(settings);
-    auto *audio_settings = obs_data_create();
-    obs_data_set_int(audio_settings, "bitrate", 128);
-    auto *a = obs_audio_encoder_create("ffmpeg_opus", "PERI Opus", audio_settings, 0, nullptr);
-    obs_data_release(audio_settings);
-    if (v && a) {
-        obs_encoder_set_video(v, obs_get_video());
-        obs_encoder_set_audio(a, obs_get_audio());
-        obs_output_set_video_encoder(o->obs, v);
-        obs_output_set_audio_encoder(o->obs, a, 0);
+    return v;
+}
+
+bool uses_codec(obs_encoder_t *encoder, const char *codec)
+{
+    return encoder && std::strcmp(obs_encoder_get_codec(encoder), codec) == 0;
+}
+
+bool configure_encoders(Output *o)
+{
+    // OBS owns the attached encoders. Preserve their profile settings when compatible.
+    // OBS 持有已挂载的编码器，格式兼容时直接保留直播配置。
+    auto *video = obs_output_get_video_encoder(o->obs);
+    if (!uses_codec(video, "av1")) {
+        video = fallback_video_encoder();
+        if (!video) return false;
+        obs_encoder_set_video(video, obs_get_video());
+        obs_output_set_video_encoder(o->obs, video);
+        obs_encoder_release(video);
+        blog(LOG_INFO, "[PERI] Using fallback AV1 encoder at 20000 kbps / 使用默认 AV1 编码");
+    } else {
+        // PERI carries one video timestamp. Clone incompatible settings locally so
+        // recording encoders and saved OBS profiles keep their original configuration.
+        // PERI 仅携带一个视频时间戳；局部复制配置，保留录制与用户档案。
+        auto *settings = obs_encoder_get_settings(video);
+        if (obs_data_get_int(settings, "bf") > 0) {
+            auto *copy = obs_data_create();
+            obs_data_apply(copy, settings);
+            obs_data_set_int(copy, "bf", 0);
+            auto *ordered = obs_video_encoder_create(obs_encoder_get_id(video), "PERI AV1 (no B frames)", copy, nullptr);
+            obs_data_release(copy);
+            if (!ordered) { obs_data_release(settings); return false; }
+            obs_encoder_set_video(ordered, obs_encoder_video(video));
+            if (obs_encoder_scaling_enabled(video)) {
+                obs_encoder_set_scaled_size(ordered, obs_encoder_get_width(video), obs_encoder_get_height(video));
+                obs_encoder_set_gpu_scale_type(ordered, obs_encoder_get_scale_type(video));
+            }
+            obs_encoder_set_preferred_video_format(ordered, obs_encoder_get_preferred_video_format(video));
+            obs_output_set_video_encoder(o->obs, ordered);
+            obs_encoder_release(ordered);
+            video = obs_output_get_video_encoder(o->obs);
+        }
+        obs_data_release(settings);
+        blog(LOG_INFO, "[PERI] Using OBS streaming video encoder / 沿用 OBS 直播视频编码器: %s",
+             obs_encoder_get_id(video));
     }
-    const bool ok = v && a;
-    obs_encoder_release(v);
-    obs_encoder_release(a);
-    return ok;
+    auto *audio = obs_output_get_audio_encoder(o->obs, 0);
+    if (uses_codec(audio, "opus")) return true;
+    auto *settings = obs_data_create();
+    obs_data_set_int(settings, "bitrate", 128);
+    audio = obs_audio_encoder_create("ffmpeg_opus", "PERI Opus", settings, 0, nullptr);
+    obs_data_release(settings);
+    if (!audio) return false;
+    obs_encoder_set_audio(audio, obs_get_audio());
+    obs_output_set_audio_encoder(o->obs, audio, 0);
+    obs_encoder_release(audio);
+    return true;
 }
 
 bool start(void *data)
 {
     auto *o = static_cast<Output *>(data);
     o->shutdown();
-    o->pipe = take_binding();
-    if (!o->pipe) { obs_output_set_last_error(o->obs, "Start PERI from its publisher settings."); return false; }
     try {
         if (!configure_encoders(o) || !obs_output_can_begin_data_capture(o->obs, 0) ||
             !obs_output_initialize_encoders(o->obs, 0))
             throw std::runtime_error("Cannot initialize OBS AV1 and Opus encoders.");
+        auto *service = obs_output_get_service(o->obs);
+        const char *key = service ? obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_STREAM_KEY) : nullptr;
+        if (!key || !*key) throw std::runtime_error("请填写服务器签发的 PERI Token / Missing publish token");
+        if (!o->ready) throw std::runtime_error("Cannot create PERI writer event");
+        for (auto &slot : o->ring) slot.reserve(max_payload + 17);
+        o->live = peri_live_open(key, &o->cancel, o->error, sizeof o->error);
+        if (!o->live) throw std::runtime_error(o->error);
+        o->need_key = true;
         o->failed = false;
         o->closing = false;
         o->joined = false;
@@ -200,29 +240,46 @@ void packet(void *data, encoder_packet *p)
     auto *o = static_cast<Output *>(data);
     if (o->closing) return;
     try {
-        if (!p || !p->data || !p->size || p->size > max_payload || o->failed)
+        if (o->failed) throw std::runtime_error(o->error);
+        if (!p || !p->data || !p->size)
             throw std::runtime_error("Invalid encoded packet or publisher disconnected.");
         bool video = p->type == OBS_ENCODER_VIDEO;
-        if (video && p->pts != p->dts) throw std::runtime_error("PERI requires video without frame reordering.");
+        if (p->size > max_payload) {
+            if (video) o->need_key = true;
+            ++o->dropped;
+            return;
+        }
+        if (video && p->pts != p->dts) throw std::runtime_error("PERI requires no frame reordering. Set B-frames to 0 in OBS. / 请在 OBS 直播输出将 B 帧设为 0。");
         if (!o->joined) {
             if (!video || !p->keyframe) return;
-            if (!o->enqueue(o->catalog())) throw std::runtime_error("Cannot submit catalog.");
+            auto *slot = o->reserve_slot();
+            if (!slot) return;
+            auto catalog = o->catalog();
+            slot->assign(catalog.begin(), catalog.end());
+            o->commit();
             o->origin = p->dts_usec;
             o->joined = true;
         }
         if (p->dts_usec < o->origin) return;
-        Bytes block;
-        block.reserve(17 + p->size);
+        if (video && o->need_key && !p->keyframe) { ++o->dropped; return; }
+        auto *slot = o->reserve_slot();
+        if (!slot) {
+            if (video) o->need_key = true;
+            ++o->dropped;
+            return;
+        }
+        if (video) o->need_key = false;
+        auto &block = *slot;
         block.push_back(video ? (p->keyframe ? 1 : 2) : 3);
         append_be(block, uint64_t(p->dts_usec - o->origin), 8);
         append_be(block, video ? o->video_duration : o->audio_duration, 4);
         append_be(block, p->size, 4);
         block.insert(block.end(), p->data, p->data + p->size);
-        if (!o->enqueue(std::move(block))) throw std::runtime_error("PERI publisher queue is full.");
+        o->commit();
     } catch (const std::exception &e) {
         obs_output_set_last_error(o->obs, e.what());
         o->closing = true;
-        o->wake.notify_all();
+        SetEvent(o->ready);
         obs_output_signal_stop(o->obs, OBS_OUTPUT_ERROR);
     }
 }
@@ -235,13 +292,6 @@ void stop(void *data, uint64_t)
 const char *name(void *) { return "PERI"; }
 } // namespace
 
-extern "C" __declspec(dllexport) bool peri_bind_sink(HANDLE handle)
-{
-    std::lock_guard guard(binding_lock);
-    if (pending) CloseHandle(pending);
-    pending = nullptr;
-    return !handle || DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &pending, 0, FALSE, DUPLICATE_SAME_ACCESS);
-}
 bool obs_module_load(void)
 {
     obs_output_info output{};
@@ -259,15 +309,56 @@ bool obs_module_load(void)
     output.encoded_packet = packet;
     obs_register_output(&output);
 
-    obs_service_info service{};
-    service.id = "peri_native_service";
-    service.get_name = name;
-    service.create = [](obs_data_t *, obs_service_t *s) -> void * { return s; };
-    service.destroy = [](void *) {};
-    service.get_protocol = [](void *) { return "PERI"; };
-    service.get_output_type = [](void *) { return "peri_native_output"; };
-    service.get_connect_info = [](void *, uint32_t type) { return type == OBS_SERVICE_CONNECT_INFO_SERVER_URL ? "peri://relay" : ""; };
-    service.can_try_to_connect = [](void *) { std::lock_guard guard(binding_lock); return pending != nullptr; };
-    obs_register_service(&service);
     return true;
+}
+
+namespace {
+HANDLE catalog_stop = nullptr;
+std::thread catalog_thread;
+
+// The OBS service updater can replace services.json after module initialization.
+// OBS 内置更新器可能在插件初始化后替换清单；监测文件变动并重新合并服务。
+void follow_catalog(std::string stock, std::string user)
+{
+    auto dir = std::filesystem::u8path(user).parent_path();
+    HANDLE changed = FindFirstChangeNotificationW(dir.c_str(), FALSE,
+                          FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
+    HANDLE events[] = {catalog_stop, changed};
+    while (WaitForSingleObject(catalog_stop, 0) != WAIT_OBJECT_0) {
+        bool ok = peri_register_catalog(stock.c_str(), user.c_str());
+        if (changed == INVALID_HANDLE_VALUE) {
+            if (WaitForSingleObject(catalog_stop, 3000) == WAIT_OBJECT_0) break;
+            changed = FindFirstChangeNotificationW(dir.c_str(), FALSE,
+                          FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
+            events[1] = changed;
+            continue;
+        }
+        auto result = WaitForMultipleObjects(2, events, FALSE, ok ? INFINITE : 1000);
+        if (result == WAIT_OBJECT_0 || result == WAIT_FAILED) break;
+        if (result == WAIT_OBJECT_0 + 1 && !FindNextChangeNotification(changed)) break;
+    }
+    if (changed != INVALID_HANDLE_VALUE) FindCloseChangeNotification(changed);
+}
+}
+void obs_module_post_load(void)
+{
+    auto *services = obs_get_module("rtmp-services");
+    if (!services || catalog_thread.joinable()) return;
+    char *stock = obs_find_module_file(services, "services.json");
+    char *user = obs_module_get_config_path(services, "services.json");
+    if (stock && user) {
+        if (!peri_register_catalog(stock, user))
+            blog(LOG_WARNING, "[PERI] Service catalog busy, retrying / 服务清单稍后重试");
+        catalog_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (catalog_stop) catalog_thread = std::thread(follow_catalog, std::string(stock), std::string(user));
+    }
+    bfree(stock);
+    bfree(user);
+}
+void obs_module_unload(void)
+{
+    if (catalog_stop) SetEvent(catalog_stop);
+    if (catalog_thread.joinable()) catalog_thread.join();
+    if (catalog_stop) CloseHandle(catalog_stop);
+    catalog_stop = nullptr;
 }
