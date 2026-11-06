@@ -189,7 +189,25 @@ def start_stream():
 
 
 def poll():
-    if phase in ("idle", "stopping"):
+    global phase, deadline
+    if phase == "idle":
+        return
+    if phase in ("stopping", "finishing"):
+        # Clean up on the timer, outside OBS output callbacks.
+        # 在定时器中清理，避免在 OBS 输出回调内等待或切换服务。
+        if phase == "stopping" and time.monotonic() >= deadline:
+            if obs.obs_frontend_streaming_active():
+                output = obs.obs_frontend_get_streaming_output()
+                if output:
+                    try:
+                        obs.obs_output_force_stop(output)
+                    finally:
+                        obs.obs_output_release(output)
+                deadline = time.monotonic() + 3
+            else:
+                phase = "finishing"
+        if phase == "finishing" and all(not p or p.poll() is not None for p in (bridge, publisher)):
+            stop()
         return
     if publisher.poll() is not None or bridge.poll() is not None:
         obs.script_log(obs.LOG_ERROR, f"发布进程已退出，请查看 {log_path}")
@@ -215,15 +233,24 @@ def poll():
                     end(None, None)
 
 
+def begin_shutdown():
+    global phase, deadline
+    if phase in ("idle", "stopping", "finishing"):
+        return
+    phase, deadline = "stopping", time.monotonic() + 3
+    # Release the local RTMP receiver so the OBS output can finish.
+    # 释放本机 RTMP 接收端，使 OBS 输出可以结束。
+    for child in (publisher, bridge):
+        if child and child.poll() is None:
+            child.terminate()
+
+
 def end(props, prop):
-    global phase
     if phase in ("starting", "live"):
-        phase = "stopping"
+        begin_shutdown()
         obs.obs_frontend_streaming_stop()
-        if phase == "stopping" and not obs.obs_frontend_streaming_active():
-            stop()
-    elif phase != "stopping":
-        stop()
+    elif phase == "arming":
+        begin_shutdown()
     return False
 
 
@@ -252,8 +279,11 @@ def event(kind):
     global phase
     if phase == "starting" and kind == obs.OBS_FRONTEND_EVENT_STREAMING_STARTED:
         phase = "live"
+    elif phase in ("starting", "live") and kind == obs.OBS_FRONTEND_EVENT_STREAMING_STOPPING:
+        begin_shutdown()
     elif phase in ("starting", "live", "stopping") and kind == obs.OBS_FRONTEND_EVENT_STREAMING_STOPPED:
-        stop()
+        begin_shutdown()
+        phase = "finishing"
 
 
 def script_load(settings):
