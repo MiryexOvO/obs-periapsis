@@ -19,6 +19,8 @@
 #include "key-trace.hpp"
 
 OBS_DECLARE_MODULE()
+void peri_settings_ui_install();
+void peri_settings_ui_uninstall();
 MODULE_EXPORT const char *obs_module_description(void) { return "PERI AV1/Opus output"; }
 
 namespace {
@@ -31,6 +33,7 @@ uint64_t wall_ms()
 }
 constexpr size_t max_payload = 1024 * 1024 - 68;
 extern "C" void *peri_live_open(const char *, void **, char *, size_t);
+extern "C" void *peri_live_open_at(const char *, const char *, void **, char *, size_t);
 extern "C" bool peri_live_send(void *, const uint8_t *, size_t, char *, size_t);
 extern "C" int32_t peri_live_send_budget(void *, const uint8_t *, size_t, uint32_t, char *, size_t);
 extern "C" void peri_live_cancel(void *);
@@ -506,7 +509,8 @@ bool start(void *data)
         if (!key || !*key) throw std::runtime_error("请填写服务器签发的 PERI Token / Missing publish token");
         if (!o->ready || !o->feedback_stop) throw std::runtime_error("Cannot create PERI worker events");
         for (auto &slot : o->ring) slot.reserve(max_payload + 17);
-        o->live = peri_live_open(key, &o->cancel, o->error, sizeof o->error);
+        const char *server = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+        o->live = peri_live_open_at(server ? server : "", key, &o->cancel, o->error, sizeof o->error);
         if (!o->live) throw std::runtime_error(o->error);
         o->feedback = peri_live_feedback_open(o->live);
         auto *encoder = obs_output_get_video_encoder(o->obs);
@@ -665,6 +669,7 @@ void follow_catalog(std::string stock, std::string user)
 }
 void obs_module_post_load(void)
 {
+    peri_settings_ui_install();
     auto *services = obs_get_module("rtmp-services");
     if (!services || catalog_thread.joinable()) return;
     char *stock = obs_find_module_file(services, "services.json");
@@ -680,6 +685,7 @@ void obs_module_post_load(void)
 }
 void obs_module_unload(void)
 {
+    peri_settings_ui_uninstall();
     if (catalog_stop) SetEvent(catalog_stop);
     if (catalog_thread.joinable()) catalog_thread.join();
     if (catalog_stop) CloseHandle(catalog_stop);

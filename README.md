@@ -4,9 +4,15 @@
 
 已在 OBS Studio 32.1.2 x64 验证。下载并解压 `PERI-OBS-Windows-x64.zip`。从「工具 → 脚本」移除旧的 `peri_publish.py`（如果已加载），完全退出 OBS，再双击 `Install-PERI.cmd`。出现写入权限错误时以管理员身份运行。安装器把插件复制到 Windows 的 ProgramData OBS 插件目录。便携版也可手动将包内的 peri-output.dll 和 peri_obs.dll 放到 OBS 安装目录的 obs-plugins/64bit。
 
-1. 管理员在服务器运行 `./target/release/peri-webtransport obs-token --public-ip 主播可达的IPv4`，私下把整段发布 Token 给主播。Token 包含目标 UDP 地址、资源名、TLS 名称、公开证书和发布凭据。轮换推流码或证书后重新签发。
-2. 打开「设置 → 直播」，服务选择 **PERI**，将整段 Token 粘贴进「推流码」。服务器选项使用 Token 内的地址。
+1. 管理员在服务器运行 `./target/release/peri-webtransport link`，私下交给主播输出的服务器地址和推流码。首次部署使用 `setup`；已有部署修改连接地址使用 `configure`，不用编辑 JSON。
+2. 打开「设置 → 直播」，服务选择 **PERI**。在服务器栏直接输入 `peri://IP:端口`，在推流码栏粘贴 `peri1_` 开头的推流码，点击应用。地址和端口可独立修改，无需重新生成推流码。
 3. 在「设置 → 输出 → 直播」选择 AV1，在「设置 → 视频」选择分辨率和帧率，点击主窗口「开始直播」。停止使用同一窗口的「停止直播」。
+
+例如直连服务器填写 `peri://192.0.2.10:4444`，有端口映射时填写主播实际连接的外部地址，如 `peri://43.248.128.243:23927`。IPv6 使用 `peri://[IPv6地址]:端口`。当前入口要求 IP 字面量，不接受域名或附加路径。主播无需下载或安装证书；推流码自带服务器身份指纹，插件在发送凭据前验证身份。它是私密的机器生成凭据，不是可随意填写的短口令。
+
+旧 `peri://v1/…` Token 继续兼容：服务器栏保留 `peri://invitation` 时使用旧 Token 内地址，填写明确的 `peri://IP:端口` 时覆盖旧地址。证书或发布凭据轮换后需重新取得推流码；单纯修改 IP/端口不需要轮换。此连接简化只作用于 OBS 发布，浏览器 WebTransport 的 HTTPS 要求不变。
+
+可编辑服务器栏由插件扩展 OBS 32.1.2 的原设置页实现，不修改 OBS 安装文件；其他服务的输入方式保持原样。更新时请完全退出 OBS，再成套替换两个 DLL。
 
 主播端运行依赖为 OBS 及其编码器。C++ 插件通过 C ABI 调用安装包内的 Rust 动态库 peri_obs.dll。原生回调将编码包放入有界环形缓冲区。网络线程停读时回调直接丢包；丢过视频包后等待关键帧再发布视频，避免传播断裂的参考帧链。普通停播取消网络等待后回收线程。插件沿用 AV1 与 Opus 配置，NVENC 的 B 帧会在本次发布专用实例中禁用，其他不兼容格式回退到 AV1 / Opus。
 
@@ -37,10 +43,12 @@ OBS 32 的直播设置从 rtmp-services 的服务清单读取可选项。插件�
 将此仓库与 periapsis 仓库并排放置。在安装了 Rust 和 x64 MSVC 的开发者 PowerShell 中运行：
 
 ```powershell
-./native/build.ps1 -ObsInclude D:/sdk/libobs -ObsLibrary D:/sdk/lib/obs.lib
+./native/build.ps1 -ObsInclude D:/sdk/libobs -ObsLibrary D:/sdk/lib/obs.lib -Qt D:/sdk/qt6
 ```
 
 生成的 ZIP 位于本仓库根目录。tests/ring-pressure.cpp 可链接 obs.lib 做独立的拥塞回归测试；它让网络消费者完全停读，并验证回调返回、容量和关键帧恢复。
+
+设置页扩展需与 OBS 匹配的 Qt 开发包；本次使用 OBS 官方 [2025-08-23 依赖包](https://github.com/obsproject/obs-deps/releases/tag/2025-08-23) 中的 Windows x64 Qt 6.8.3。运行时复用 OBS 自带的 Qt DLL，不向安装包复制另一套 Qt。默认 SDK 路径为相邻仓库 `target/obs-sdk/qt6`。`settings-ui.cpp` 回归覆盖地址编辑、保存数据、重新加载及其他服务隔离。
 
 `tests/build-check.ps1` 构建插件和原生回归夹具（默认使用本机 `D:/VS`、`D:/Windows Kits/10` 及相邻项目 `target/obs-sdk`，可配置路径）。在相邻 periapsis 仓库执行 `cargo build --release --locked -p peri-native --example obs_recovery`，再执行 `node ../obs-periapsis/tests/recovery-check.cjs`，可用隔离的真实 libobs/NVENC、Relay 与 FFmpeg 验证恢复 GOP。测试将周期关键帧设为 30 秒，先观察 1 秒无请求对照，再请求恢复并独立解码 30 帧；结果保存在 periapsis/dist。
 

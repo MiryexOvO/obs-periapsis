@@ -2,10 +2,13 @@
 // 阻塞传输线程，同时持续调用真实的 OBS 编码包回调。
 #include "../native/peri-output.cpp"
 #include <cstdio>
+void peri_settings_ui_install() {}
+void peri_settings_ui_uninstall() {}
 static HANDLE sending = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 static HANDLE release_writer = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 static std::atomic<unsigned> expired{0};
 extern "C" void *peri_live_open(const char *, void **, char *, size_t) { return nullptr; }
+extern "C" void *peri_live_open_at(const char *, const char *, void **, char *, size_t) { return nullptr; }
 extern "C" bool peri_register_catalog(const char *, const char *) { return true; }
 extern "C" void peri_live_close(void *) {}
 extern "C" void *peri_live_feedback_open(const void *) { return nullptr; }

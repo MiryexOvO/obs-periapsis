@@ -46,7 +46,7 @@ int main(){
     fprintf(stderr,"PICKER OK\n");
     auto *settings=obs_data_create();obs_data_set_string(settings,"service","PERI");
     auto *props=obs_get_service_properties("rtmp_common");obs_property_modified(obs_properties_get(props,"service"),settings);obs_properties_destroy(props);
-    fprintf(stderr,"UI protocol=%s\n",obs_data_get_string(settings,"protocol"));obs_data_set_string(settings,"server","peri://invitation");obs_data_set_string(settings,"key",getenv("PERI_OBS_TEST_TICKET"));
+    fprintf(stderr,"UI protocol=%s\n",obs_data_get_string(settings,"protocol"));obs_data_set_string(settings,"server",getenv("PERI_OBS_TEST_SERVER")?getenv("PERI_OBS_TEST_SERVER"):"peri://invitation");obs_data_set_string(settings,"key",getenv("PERI_OBS_TEST_TICKET"));
     auto *service=obs_service_create("rtmp_common","PERI catalog test",settings,nullptr);obs_data_release(settings);
     if(!service || std::string(obs_service_get_protocol(service))!="PERI"){fprintf(stderr,"wrong protocol\n");return 9;}
     fprintf(stderr,"Native picker contains PERI, protocol selected\n");
