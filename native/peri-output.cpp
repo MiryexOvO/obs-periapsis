@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: BSD-3-Clause
 // Native OBS encoded output for the PERI publisher. / PERI 发布端的 OBS 原生编码输出。
 #define NOMINMAX
 #include <windows.h>

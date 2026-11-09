@@ -17,5 +17,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-echo Installed. Open OBS - Settings - Stream - PERI, then paste the publish token.
+echo Installed. Open OBS - Settings - Stream - PERI.
+echo Enter peri://IP:port in Server, then paste your stream key.
 pause

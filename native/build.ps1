@@ -6,6 +6,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Core = (Resolve-Path $Core).Path
+$releaseVersion = (Get-Content -LiteralPath (Join-Path $Core 'VERSION') -Raw).Trim()
+if ($releaseVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version' }
 if (!$Qt) { $Qt = Join-Path $Core 'target/obs-sdk/qt6' }
 if (!(Test-Path "$Qt/include/QtWidgets/QComboBox")) { throw 'Qt 6 SDK required: pass -Qt with matching OBS Qt SDK path.' }
 & cargo build --release --locked --manifest-path (Join-Path $Core 'Cargo.toml') -p peri-obs
@@ -20,7 +22,16 @@ try {
     if ($LASTEXITCODE) { throw 'OBS module build failed / OBS 模块构建失败' }
     Copy-Item -Force -LiteralPath (Join-Path $Core 'target/release/peri_obs.dll') -Destination $payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Install-PERI.cmd') -Destination .
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../README.md') -Destination README.md
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../LICENSE') -Destination LICENSE
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../LICENSE-HISTORY.md') -Destination LICENSE-HISTORY.md
+    Copy-Item -LiteralPath (Join-Path $Core 'VERSION') -Destination VERSION
     $zip = Join-Path $PSScriptRoot '../PERI-OBS-Windows-x64.zip'
-    Compress-Archive -Force -Path peri-output,Install-PERI.cmd -DestinationPath $zip
+    Compress-Archive -Force -Path peri-output,Install-PERI.cmd,README.md,LICENSE,LICENSE-HISTORY.md,VERSION -DestinationPath $zip
+    $sourceHashes = @{}
+    Get-ChildItem -LiteralPath $PSScriptRoot -File | ForEach-Object {
+        $sourceHashes['native/' + $_.Name] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    @{version=$releaseVersion; sha256=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant(); coreSha256=(Get-FileHash -LiteralPath "$payload/peri_obs.dll" -Algorithm SHA256).Hash.ToLowerInvariant(); sources=$sourceHashes} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $PSScriptRoot '../release-build.json')
     Write-Output $zip
 } finally { Pop-Location }

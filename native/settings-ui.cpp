@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: BSD-3-Clause
 // Extend only PERI's server field in the existing OBS settings page.
 #include <QApplication>
 #include <QComboBox>
@@ -35,6 +35,7 @@ class Binding : public QObject {
         {
             QSignalBlocker blocker(server);
             server->setEditable(true);
+            server->setCompleter(nullptr);
             server->setInsertPolicy(QComboBox::NoInsert);
             server->setStyleSheet(originalStyle + QStringLiteral(
                 " QComboBox::drop-down {width:0px;border:0px;} QComboBox::down-arrow {image:none;}"));
@@ -49,10 +50,24 @@ class Binding : public QObject {
         // emit its existing change signal so Apply/OK use the normal save path.
         connect(server->lineEdit(), &QLineEdit::textEdited, this, [this](const QString &text) {
             if (!enabled || !server || !service || service->currentText() != QStringLiteral("PERI")) return;
+            // Updating any model role can make QComboBox reload DisplayRole into
+            // its editor. Copy the signal text before touching that model.
+            const QString edited = text;
+            auto *editor = server->lineEdit();
+            const int cursor = editor->cursorPosition();
+            const int selection = editor->selectionStart();
+            const int selectionLength = editor->selectedText().size();
             const int index = server->currentIndex();
             {
                 QSignalBlocker blocker(server);
-                server->setItemData(index, text.trimmed());
+                QSignalBlocker editorBlocker(editor);
+                server->setItemText(index, edited);
+                server->setItemData(index, edited.trimmed());
+                editor->setText(edited);
+                if (selection >= 0) {
+                    if (cursor == selection) editor->setSelection(selection + selectionLength, -selectionLength);
+                    else editor->setSelection(selection, selectionLength);
+                } else editor->setCursorPosition(cursor);
             }
             QMetaObject::invokeMethod(server, "currentIndexChanged", Qt::DirectConnection, Q_ARG(int, index));
         });

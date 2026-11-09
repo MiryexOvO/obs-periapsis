@@ -1,6 +1,8 @@
 #include "../native/settings-ui.cpp"
 #include <QDialog>
 #include <QFormLayout>
+#include <QClipboard>
+#include <QKeyEvent>
 #include <cassert>
 #include <cstdio>
 int main(int argc, char **argv) {
@@ -35,11 +37,38 @@ int main(int argc, char **argv) {
     auto edit = [&](const QString &value) {
         server->lineEdit()->setText(value);
         QMetaObject::invokeMethod(server->lineEdit(), "textEdited", Qt::DirectConnection, Q_ARG(QString, value));
+        assert(server->lineEdit()->text() == value);
     };
     edit("peri://192.0.2.10:4444");
     assert(server->currentData().toString() == "peri://192.0.2.10:4444" && changes == 1);
     edit("peri://43.248.128.243:23927");
     assert(server->currentData().toString() == "peri://43.248.128.243:23927" && changes == 2);
+    auto press = [&](int keyCode, Qt::KeyboardModifiers modifiers = Qt::NoModifier, const QString &text = QString()) {
+        QKeyEvent event(QEvent::KeyPress, keyCode, modifiers, text);
+        QApplication::sendEvent(server->lineEdit(), &event);
+    };
+    // Exercise real editor events, not just programmatic field assignment.
+    edit("peri://invitation");
+    press(Qt::Key_A, Qt::ControlModifier);
+    press(Qt::Key_Backspace);
+    assert(server->lineEdit()->text().isEmpty() && server->currentData().toString().isEmpty());
+    QString typed;
+    for (const auto ch : QStringLiteral("peri://192.0.2.10:4444")) {
+        typed += ch;
+        press(0, Qt::NoModifier, QString(ch));
+        assert(server->lineEdit()->text() == typed);
+        assert(server->currentData().toString() == typed);
+        assert(server->lineEdit()->cursorPosition() == typed.size());
+    }
+    server->lineEdit()->setCursorPosition(8);
+    press(Qt::Key_Delete);
+    typed.remove(8, 1);
+    assert(server->lineEdit()->text() == typed && server->lineEdit()->cursorPosition() == 8);
+    QApplication::clipboard()->setText("peri://43.248.128.243:23927");
+    press(Qt::Key_A, Qt::ControlModifier);
+    press(Qt::Key_V, Qt::ControlModifier);
+    assert(server->lineEdit()->text() == "peri://43.248.128.243:23927");
+    assert(server->currentData().toString() == server->lineEdit()->text());
     // Persisted values are reloaded by OBS as a new list item.
     const auto saved = server->currentData().toString();
     delete binding;

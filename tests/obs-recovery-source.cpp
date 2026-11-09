@@ -93,6 +93,16 @@ int main(){
             value^=value>>16;value*=0x7feb352du;value^=value>>15;value*=0x846ca68bu;value^=value>>16;
             pix[k]=uint8_t(value);pix[k+1]=uint8_t(value>>8);pix[k+2]=uint8_t(value>>16);
         }
+        if(getenv("PERI_OBS_TEST_TRANSITIONS")) {
+            const int phase=i%900;
+            if(phase==0 || phase==300 || phase==420 || phase==540)
+                fprintf(stderr,"TRANSITION frame=%d wall_ms=%lld scene=%s\n",i,(long long)stamp,
+                    phase==300?"black":phase==420?"white":"motion");
+            if(phase>=300 && phase<540) {
+                const uint8_t color=phase<420?0:255;
+                for(size_t k=0;k<pix.size();k+=4)pix[k]=pix[k+1]=pix[k+2]=color;
+            }
+        }
         // A directly attached async source is not automatically scaled by libobs.
         // 直接挂载的异步源不会自动铺满画布，显式扩大测试纹理，避免只测左上角小画面。
         if(network) for(size_t y=0;y<1440;y++){
