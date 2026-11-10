@@ -54,7 +54,7 @@ OBS 32 的直播设置从 rtmp-services 的服务清单读取可选项。插件�
 
 The native checks use an isolated real libobs/NVENC source, a local Relay, and FFmpeg decoding. A 30-second periodic GOP plus a one-second no-request control distinguishes active recovery from periodic keys. These checks measure local request-to-key delivery, not public-network latency.
 
-## 1.0.0 正式发布
+## 1.0.0 测试发布
 
 配套 PERI 1.0.0，OBS 32.1.2 / Windows x64。正式资产名称为 `PERI-OBS-1.0.0-Windows-x64.zip`；包内 VERSION 标明版本，两个 DLL 必须成套替换。协议保持现有 ALPN 与封装。安装前退出 OBS，输入自由编辑的 `peri://IP:端口` 与独立推流码。
 
